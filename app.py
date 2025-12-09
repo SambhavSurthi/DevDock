@@ -253,7 +253,7 @@ def refine_points(raw_points):
         iso = parsed.isoformat() if parsed else None
         key = (iso if iso else date_str or "", (contest or "").strip())
         
-        score = sum(1 for v in (rating, rank, date_str, contest) if v.notnull() if hasattr(v, 'notnull') else v)
+        score = 0
         # Simplified scoring logic
         if rating: score += 1
         if rank: score += 1
@@ -290,6 +290,7 @@ async def click_platform_locator(page, platform_text):
     }""", platform_text)
 
 async def wait_for_panel_change(page, old_snapshot, timeout=CLICK_WAIT_TIMEOUT):
+    if not old_snapshot: return False
     old_date = old_snapshot.get("date")
     old_contest = old_snapshot.get("contestName")
     fn = """(oldDate, oldContest, sel) => { 
@@ -337,11 +338,14 @@ async def scrape_codolio(username: str):
         page = await get_page(context)
         
         try:
-            await page.goto(url, wait_until="networkidle", timeout=60000) # Wait for network idle to ensure hydration
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000) # Faster load
             
             # Wait for meaningful content
             try:
                 await page.wait_for_selector("text=Total Questions", timeout=20000)
+                # Ensure contest section is loaded too
+                try: await page.wait_for_selector("text=Contest Rankings", timeout=5000)
+                except: pass
             except:
                 print("LOG: Checkpoint 'Total Questions' not found (timeout).")
 
@@ -402,24 +406,45 @@ async def scrape_codolio(username: str):
             # Ratings
             def get_rating_snippet(pname):
                 return f"""() => {{
-                    const el = Array.from(document.querySelectorAll('div')).find(x => x.innerText === '{pname}');
+                    // Find the header div (e.g., LEETCODE, CODECHEF) - text is likely uppercase in this section
+                    const headers = Array.from(document.querySelectorAll('div.font-semibold.text-center.text-gray-500'));
+                    const el = headers.find(x => x.innerText.trim().toLowerCase() === '{pname.lower()}');
+                    
                     if(!el) return '0';
-                    const maxSpan = Array.from(el.parentElement.querySelectorAll('span')).find(s => s.innerText.includes('max :'));
-                    return maxSpan ? maxSpan.innerText.replace('max :', '').replace('(', '').replace(')', '').trim() : '0';
+                    
+                    // Traverse to parent container
+                    const container = el.parentElement;
+                    if (!container) return '0';
+                    
+                    // Find span with 'max :'
+                    const spans = Array.from(container.querySelectorAll('span'));
+                    const maxSpan = spans.find(s => s.innerText.toLowerCase().includes('max :'));
+                    
+                    if (maxSpan) {{
+                        return maxSpan.innerText.toLowerCase().replace('max :', '').replace('(', '').replace(')', '').trim();
+                    }}
+                    return '0';
                 }}"""
             
-            data["contestRankings"]["leetcode_current_rating"] = await get_text_xpath("//div[div[text()='LEETCODE']]//h3")
-            data["contestRankings"]["leetcode_max-rating"] = await page.evaluate(get_rating_snippet('LEETCODE'))
-            data["contestRankings"]["codechef_current_rating"] = await get_text_xpath("//div[div[text()='CODECHEF']]//h3")
-            data["contestRankings"]["codechef_max-rating"] = await page.evaluate(get_rating_snippet('CODECHEF'))
-            data["contestRankings"]["codeforces_current_rating"] = await get_text_xpath("//div[div[text()='CODEFORCES']]//h3")
-            data["contestRankings"]["codeforces_max-rating"] = await page.evaluate(get_rating_snippet('CODEFORCES'))
-            data["contestRankings"]["GeeksForGeeks_current_rating"] = await get_text_xpath("//div[div[text()='GEEKSFORGEEKS']]//h3")
-            data["contestRankings"]["GeeksForGeeks_max-rating"] = await page.evaluate(get_rating_snippet('GEEKSFORGEEKS'))
-            data["contestRankings"]["AtCoder_current_rating"] = await get_text_xpath("//div[div[text()='ATCODER']]//h3")
-            data["contestRankings"]["AtCoder_max-rating"] = await page.evaluate(get_rating_snippet('ATCODER'))
-            data["contestRankings"]["codestudio_current_rating"] = await get_text_xpath("//div[div[text()='CODESTUDIO']]//h3")
-            data["contestRankings"]["codestudio_max-rating"] = await page.evaluate(get_rating_snippet('CODESTUDIO'))
+            # Helper for case-insensitive xpath text match
+            def ci_xpath(text):
+                return f"translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='{text.lower()}'"
+
+            # Note: The headers in the ratings card section seem to be UPPERCASE (e.g. LEETCODE) based on user snippet
+            # But we use case-insensitive matching to be safe.
+            
+            data["contestRankings"]["leetcode_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('LeetCode')}]]//h3")
+            data["contestRankings"]["leetcode_max-rating"] = await page.evaluate(get_rating_snippet('LeetCode'))
+            data["contestRankings"]["codechef_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('CodeChef')}]]//h3")
+            data["contestRankings"]["codechef_max-rating"] = await page.evaluate(get_rating_snippet('CodeChef'))
+            data["contestRankings"]["codeforces_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('CodeForces')}]]//h3")
+            data["contestRankings"]["codeforces_max-rating"] = await page.evaluate(get_rating_snippet('CodeForces'))
+            data["contestRankings"]["GeeksForGeeks_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('GeeksForGeeks')}]]//h3")
+            data["contestRankings"]["GeeksForGeeks_max-rating"] = await page.evaluate(get_rating_snippet('GeeksForGeeks'))
+            data["contestRankings"]["AtCoder_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('AtCoder')}]]//h3")
+            data["contestRankings"]["AtCoder_max-rating"] = await page.evaluate(get_rating_snippet('AtCoder'))
+            data["contestRankings"]["codestudio_current_rating"] = await get_text_xpath(f"//div[div[{ci_xpath('CodeStudio')}]]//h3")
+            data["contestRankings"]["codestudio_max-rating"] = await page.evaluate(get_rating_snippet('CodeStudio'))
 
             # Heatmap
             try:
@@ -480,7 +505,7 @@ async def debug_screenshot(username: str):
         context = await state.browser.new_context(viewport={"width":1920,"height":1080})
         page = await get_page(context)
         try:
-            await page.goto(url, wait_until="networkidle", timeout=60000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
             screenshot = await page.screenshot(type='jpeg', quality=50)
             b64 = base64.b64encode(screenshot).decode('utf-8')
@@ -500,6 +525,10 @@ async def post_profile(request: UsernameRequest):
     if not request.username.strip(): raise HTTPException(status_code=400, detail="Username required")
     return {"success": True, "username": request.username, "data": await scrape_codolio(request.username.strip())}
 
+# Alias for platform specific scraping
+async def scrape_contest_platform(username: str, platform: str):
+    return await scrape_generic_profile(username, platform)
+    
 async def scrape_generic_profile(username: str, platform: str):
     if not state.browser: raise HTTPException(status_code=500, detail="Browser not initialized")
     url = f"https://codolio.com/profile/{username}/problemSolving/{platform}"
@@ -507,7 +536,7 @@ async def scrape_generic_profile(username: str, platform: str):
         context = await state.browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await get_page(context)
         try:
-            await page.goto(url, wait_until="networkidle", timeout=45000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
             try: await page.wait_for_selector("text=Total Questions", timeout=20000)
             except: pass 
             await asyncio.sleep(2.0) 
@@ -558,6 +587,18 @@ async def get_interviewbit_profile(username: str):
 @app.get("/geeksforgeeks/{username}")
 async def get_geeksforgeeks_profile(username: str):
     return {"success": True, "username": username, "data": await scrape_generic_profile(username.strip(), "geeksforgeeks")}
+
+@app.get("/codechef/{username}")
+async def get_codechef_profile(username: str):
+    if not username.strip():
+        raise HTTPException(status_code=400, detail="Username required")
+    return {"success": True, "username": username, "data": await scrape_contest_platform(username.strip(), "codechef")}
+
+@app.get("/codeforces/{username}")
+async def get_codeforces_profile(username: str):
+    if not username.strip():
+        raise HTTPException(status_code=400, detail="Username required")
+    return {"success": True, "username": username, "data": await scrape_contest_platform(username.strip(), "codeforces")}
 
 @app.get("/leetcode/{username}")
 async def get_leetcode_profile(username: str):
