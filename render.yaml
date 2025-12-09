@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: codolio-scraper
+    env: docker
+    plan: free
+    branch: main
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PORT
+        value: 10000

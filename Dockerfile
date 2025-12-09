@@ -12,7 +12,8 @@ RUN pip install --no-cache-dir --upgrade pip
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Install Playwright browsers (Chromium, Firefox, WebKit)
-RUN playwright install
+# Install Playwright browsers (Chromium only to save space)
+RUN playwright install chromium
 
 # Copy application code
 COPY . .
@@ -21,4 +22,5 @@ COPY . .
 EXPOSE 5000
 
 # Run the FastAPI app
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "5000"]
+# Run the FastAPI app using the PORT environment variable provided by Render
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-5000}
