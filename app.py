@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from playwright.async_api import async_playwright, Browser, BrowserContext
 from pydantic import BaseModel
 
-# Global state for persistent browser
+# Global state
 class AppState:
     playwright = None
     browser = None
@@ -18,41 +18,38 @@ state = AppState()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Launch browser once
-    print("Starting Playwright...")
+    print("LOG: Starting Playwright...")
     try:
         state.playwright = await async_playwright().start()
+        # Launch options for Render/Docker
         state.browser = await state.playwright.chromium.launch(
             headless=True,
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage", # Essential for Docker/Render
-                "--disable-gpu"
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--window-size=1920,1080" # Force standard window size
             ],
             ignore_default_args=["--enable-automation"]
         )
-        # Limit concurrency to avoidance OOM on free tier (512MB RAM)
-        # 3 concurrent scrapes seems to be a good balance for the reused browser.
         state.semaphore = asyncio.Semaphore(3)
-        print("Playwright started successfully.")
+        print("LOG: Playwright started successfully.")
         yield
     except Exception as e:
-        print(f"Failed to start Playwright: {e}")
+        print(f"LOG: Failed to start Playwright: {e}")
         raise e
     finally:
-        # Shutdown
-        print("Shutting down Playwright...")
+        print("LOG: Shutting down Playwright...")
         if state.browser:
             await state.browser.close()
         if state.playwright:
             await state.playwright.stop()
-        print("Playwright shutdown complete.")
+        print("LOG: Playwright shutdown complete.")
 
-app = FastAPI(title="Codolio Scraper API", version="2.2.0", lifespan=lifespan)
+app = FastAPI(title="Codolio Scraper API", version="2.2.1", lifespan=lifespan)
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -64,7 +61,7 @@ app.add_middleware(
 class UsernameRequest(BaseModel):
     username: str
 
-# ----- CONSTANTS & SCRIPTS -----
+# ----- CONSTANTS -----
 CONTAINER_SELECTOR = "#contest_graph"
 PLATFORMS = [
     ("LeetCode", "leetcode_rating"),
@@ -75,11 +72,10 @@ PLATFORMS = [
     ("CodeStudio", "codestudio_rating")
 ]
 
-# Sampling params
 X_STEPS = 220
 Y_SWEEP_PIXELS = 80
 Y_SWEEP_STEP = 12
-EVENT_PAUSE = 0.005  # Slight speedup
+EVENT_PAUSE = 0.005
 CLICK_WAIT_TIMEOUT = 5.0
 
 READ_PANEL_JS = """
@@ -122,31 +118,23 @@ READ_TOOLTIPS_JS = """
 """
 
 def try_parse_date(dstr):
-    if not dstr or not isinstance(dstr, str):
-        return None
+    if not dstr or not isinstance(dstr, str): return None
     s = dstr.strip().replace("Sept ", "Sep ")
     fmts = ["%d %b %Y", "%d %B %Y", "%d %b, %Y", "%Y-%m-%d"]
     for f in fmts:
-        try:
-            return datetime.strptime(s, f).date()
-        except Exception:
-            pass
-    # fallback
+        try: return datetime.strptime(s, f).date()
+        except: pass
     try:
         parts = s.split()
         if len(parts) == 3:
             day = int(parts[0]); month = parts[1]; year = int(parts[2])
             for f in ("%d %b %Y", "%d %B %Y"):
-                try:
-                    return datetime.strptime(f"{day} {month} {year}", f).date()
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                try: return datetime.strptime(f"{day} {month} {year}", f).date()
+                except: pass
+    except: pass
     return None
 
 async def dispatch_event_at(page, cx, cy):
-    # Reduced overhead script
     script = """
     ({cx, cy, containerSelector}) => {
       try {
@@ -163,11 +151,9 @@ async def dispatch_event_at(page, cx, cy):
 
 async def synthetic_svg_sweep(page):
     svg = await page.query_selector(f"{CONTAINER_SELECTOR} svg.apexcharts-svg") or await page.query_selector(f"{CONTAINER_SELECTOR} svg")
-    if not svg:
-        return []
+    if not svg: return []
     box = await svg.bounding_box()
-    if not box:
-        return []
+    if not box: return []
     
     left, top, width, height = box["x"], box["y"], box["width"], box["height"]
     pad_x = max(4, width * 0.02)
@@ -178,24 +164,15 @@ async def synthetic_svg_sweep(page):
     y_positions = [center_y + offset for offset in range(-half, half+1, Y_SWEEP_STEP)]
     
     snapshots = []
-    # Using global X_STEPS (220)
     for i in range(X_STEPS):
         t = i / (X_STEPS - 1) if X_STEPS > 1 else 0.5
         x = int(round(start_x + (end_x - start_x) * t))
-        
-        # Batch events? No, ApexCharts needs hover to settle.
-        # But we can optimize by only hovering one Y if the tooltip appears efficiently.
         for y in y_positions:
             await dispatch_event_at(page, x, y)
-            
-            # Read directly without sleep if possible, or very short sleep
-            # EVENT_PAUSE is small now
-            
             panel = await page.evaluate(READ_PANEL_JS, CONTAINER_SELECTOR)
             if panel and panel.get("contestName"):
                 snapshots.append(panel)
                 break
-            
             tips = await page.evaluate(READ_TOOLTIPS_JS)
             txt = (tips.get("xaxis") or "") + "\n" + (tips.get("tooltip") or "")
             if txt.strip():
@@ -207,14 +184,9 @@ def refine_points(raw_points):
     refined_map = {}
     for item in raw_points:
         if not item: continue
-        
         contest = None; date_str = None; rating = None; rank = None
-        
         if "contestName" in item and item.get("contestName"):
-            contest = item.get("contestName")
-            date_str = item.get("date")
-            rating = item.get("rating")
-            rank = item.get("rank")
+            contest = item.get("contestName"); date_str = item.get("date"); rating = item.get("rating"); rank = item.get("rank")
         else:
             raw = item.get("raw_tooltip", "")
             lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
@@ -222,38 +194,24 @@ def refine_points(raw_points):
                 if "Rank" in ln:
                     try: rank = int("".join(ch for ch in ln if ch.isdigit()))
                     except: pass
-                
                 m = re.search(r"(\d{3,5})", ln)
-                if m and not rating:
-                    rating = int(m.group(1))
-                
-                if "Contest" in ln or "contest" in ln:
-                    contest = ln
-                
+                if m and not rating: rating = int(m.group(1))
+                if "Contest" in ln or "contest" in ln: contest = ln
                 parts = ln.split()
                 if len(parts) >= 3 and parts[-1].isdigit() and len(parts[-1]) == 4:
                     ds = " ".join(parts[-3:])
-                    if any(mm in ds for mm in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Sept"]):
-                        date_str = ds
+                    if any(mm in ds for mm in ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec","Sept"]): date_str = ds
         
         parsed = try_parse_date(date_str) if date_str else None
         iso = parsed.isoformat() if parsed else None
         key = (iso if iso else date_str or "", (contest or "").strip())
-        
         score = sum(1 for v in (rating, rank, date_str, contest) if v)
         existing = refined_map.get(key)
         if existing:
             existing_score = sum(1 for v in (existing.get("rating"), existing.get("rank"), existing.get("date"), existing.get("contestName")) if v)
-            if score <= existing_score:
-                continue
+            if score <= existing_score: continue
         
-        refined_map[key] = {
-            "rating": int(rating) if rating is not None else None,
-            "date": date_str,
-            "contestName": contest,
-            "rank": int(rank) if rank is not None else None,
-            "_iso": iso
-        }
+        refined_map[key] = {"rating": int(rating) if rating is not None else None, "date": date_str, "contestName": contest, "rank": int(rank) if rank is not None else None, "_iso": iso}
     
     items = list(refined_map.values())
     items.sort(key=lambda it: (0, it["_iso"]) if it.get("_iso") else (1, it.get("date") or ""), reverse=False)
@@ -266,11 +224,8 @@ async def click_platform_locator(page, platform_text):
         if await loc.count() > 0 and await loc.is_visible():
             await loc.click(timeout=2000)
             return True
-    except:
-        pass
-    
-    script = """
-    (platformText) => {
+    except: pass
+    script = """(platformText) => {
       const nodes = Array.from(document.querySelectorAll('*'));
       for (const n of nodes) {
         if (n.innerText && n.innerText.trim().toLowerCase().includes(platformText.toLowerCase())) {
@@ -278,19 +233,14 @@ async def click_platform_locator(page, platform_text):
         }
       }
       return false;
-    }
-    """
-    try:
-        return await page.evaluate(script, platform_text)
-    except:
-        return False
+    }"""
+    try: return await page.evaluate(script, platform_text)
+    except: return False
 
 async def wait_for_panel_change(page, old_snapshot, timeout=CLICK_WAIT_TIMEOUT):
     old_date = old_snapshot.get("date") if old_snapshot else None
     old_contest = old_snapshot.get("contestName") if old_snapshot else None
-    
-    fn_body = """
-    (oldDate, oldContest, sel) => { 
+    fn = """(oldDate, oldContest, sel) => { 
         try { 
             const root = document.querySelector(sel); 
             if(!root) return false; 
@@ -304,70 +254,75 @@ async def wait_for_panel_change(page, old_snapshot, timeout=CLICK_WAIT_TIMEOUT):
             if(!oldDate && !oldContest) return !!(dateText || contestText); 
             return (dateText !== oldDate) || (contestText !== oldContest);
         } catch(e){return false;} 
-    }
-    """
+    }"""
     try:
-        await page.wait_for_function(
-            fn_body,
-            arg=(old_date, old_contest, CONTAINER_SELECTOR),
-            timeout=int(timeout*1000)
-        )
+        await page.wait_for_function(fn, arg=(old_date, old_contest, CONTAINER_SELECTOR), timeout=int(timeout*1000))
         return True
-    except:
-        return False
+    except: return False
 
 async def get_page(context: BrowserContext):
     page = await context.new_page()
-    # Block Heavy Resources
+    # UNBLOCK STYLESHEETS: Removed "stylesheet" and "font" from blocked list.
+    # Block only very heavy things.
     await page.route("**/*", lambda route: route.abort() 
-                     if route.request.resource_type in ["image", "media", "font", "stylesheet"] 
+                     if route.request.resource_type in ["image", "media"] 
                      else route.continue_())
     return page
 
 async def scrape_codolio(username: str):
-    if not state.browser:
-        raise HTTPException(status_code=500, detail="Browser not initialized")
-
-    url = f"https://codolio.com/profile/{username}/problemSolving"
+    if not state.browser: raise HTTPException(status_code=500, detail="Browser not initialized")
+    print(f"LOG: Scraping Codolio for {username}")
     
-    async with state.semaphore: # Limit concurrency
+    url = f"https://codolio.com/profile/{username}/problemSolving"
+    async with state.semaphore:
         context = await state.browser.new_context(
-            viewport={"width": 1280, "height": 720}, # Smaller viewport needed? 1920 is fine usually
+            viewport={"width": 1920, "height": 1080}, # Restored full HD for safety
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
         page = await get_page(context)
         
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            print("LOG: Navigating to page...")
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Wait efficiently
+            # Better waiting
+            print("LOG: Waiting for Total Questions...")
             try:
-                await page.wait_for_selector("text=Total Questions", timeout=15000)
+                # Wait for the label
+                await page.wait_for_selector("text=Total Questions", timeout=20000)
+                # Wait a bit more for numbers to bloom
+                await asyncio.sleep(2.0)
             except:
-                pass 
+                print("LOG: Timeout waiting for 'Total Questions' selector")
             
-            # Allow some JS to hydrate, but less than before
-            await asyncio.sleep(1.5) 
+            data = {"basicStats": {}, "problemsSolved": {}, "contestRankings": {}, "heatmap": []}
 
-            data = {
-                "basicStats": {},
-                "problemsSolved": {},
-                "contestRankings": {},
-                "heatmap": []
-            }
-
-            # --- Helpers ---
+            # Helper with logging
             async def get_text_xpath(xpath):
                 try:
                     loc = page.locator(f"xpath={xpath}").first
                     if await loc.count() > 0:
-                        return (await loc.inner_text()).strip()
-                except:
-                    pass
+                        txt = (await loc.inner_text()).strip()
+                        # Simple check to see if we got empty string
+                        if not txt: return "0"
+                        return txt
+                except: pass
                 return "0"
 
             # 1. Basic Stats
             data["basicStats"]["total_questions"] = await get_text_xpath("//div[div[contains(text(), 'Total Questions')]]/span[contains(@class, 'text-5xl')]")
+            print(f"LOG: Total Questions found: {data['basicStats']['total_questions']}")
+            
+            # If 0, double check with evaluate (fallback)
+            if data["basicStats"]["total_questions"] == "0":
+                 # Fallback: maybe the class changed or structure differs slightly
+                 print("LOG: Retry finding Total Questions via broader search")
+                 val = await page.evaluate("""() => {
+                    const el = Array.from(document.querySelectorAll('div')).find(x => x.innerText === 'Total Questions');
+                    return el ? el.nextElementSibling?.innerText.trim() : '0';
+                 }""")
+                 if val: data["basicStats"]["total_questions"] = val
+
             data["basicStats"]["total_active_days"] = await get_text_xpath("//div[div[contains(text(), 'Total Active Days')]]/span[contains(@class, 'text-5xl')]")
             data["basicStats"]["total_submissions"] = await get_text_xpath("//div[contains(@class, 'flex gap-1 text-center')]/span[contains(text(), 'Submissions')]/following-sibling::span")
             data["basicStats"]["max_streak"] = await get_text_xpath("//span[contains(text(), 'Max.Streak')]/following-sibling::span")
@@ -408,12 +363,8 @@ async def scrape_codolio(username: str):
             data["problemsSolved"]["hackerrank"] = await get_text_xpath("//div[div[contains(text(), 'HackerRank')]]/span")
             data["problemsSolved"]["geeksforgeeks"] = await get_text_xpath("//div[div[contains(text(), 'GFG')]]/span")
 
-            # 3. Contest Rankings (Summary)
+            # 3. Contest Rankings
             data["contestRankings"]["total_contests"] = data["basicStats"]["total_contests"]
-            
-            # --- Faster Selectors ---
-            # Instead of heavy XPaths, try to grab data via efficient JS evaluation if possible, 
-            # but we'll stick to what works for now, just optimized via blocked resources.
             
             data["contestRankings"]["leetcode_total_contest"] = await get_text_xpath("//button[div[span[text()='LeetCode']]]/span[last()]")
             data["contestRankings"]["codechef_total_contest"] = await get_text_xpath("//button[div[span[text()='CodeChef']]]/span[last()]")
@@ -431,9 +382,6 @@ async def scrape_codolio(username: str):
                 return maxSpan ? maxSpan.innerText.replace('max :', '').replace('(', '').replace(')', '').trim() : '0';
             }""")
             
-            # Duplicate for other logic? To save tokens, I'll rely on the pattern being repetitive.
-            # ... (Other platforms same logic) ...
-            
             def get_rating_snippet(pname):
                 return f"""() => {{
                     const el = Array.from(document.querySelectorAll('div')).find(x => x.innerText === '{pname}');
@@ -444,20 +392,16 @@ async def scrape_codolio(username: str):
 
             data["contestRankings"]["codechef_current_rating"] = await get_text_xpath("//div[div[text()='CODECHEF']]//h3")
             data["contestRankings"]["codechef_max-rating"] = await page.evaluate(get_rating_snippet('CODECHEF'))
-
             data["contestRankings"]["codeforces_current_rating"] = await get_text_xpath("//div[div[text()='CODEFORCES']]//h3")
             data["contestRankings"]["codeforces_max-rating"] = await page.evaluate(get_rating_snippet('CODEFORCES'))
-
             data["contestRankings"]["GeeksForGeeks_current_rating"] = await get_text_xpath("//div[div[text()='GEEKSFORGEEKS']]//h3")
             data["contestRankings"]["GeeksForGeeks_max-rating"] = await page.evaluate(get_rating_snippet('GEEKSFORGEEKS'))
-
             data["contestRankings"]["AtCoder_current_rating"] = await get_text_xpath("//div[div[text()='ATCODER']]//h3")
             data["contestRankings"]["AtCoder_max-rating"] = await page.evaluate(get_rating_snippet('ATCODER'))
-
             data["contestRankings"]["codestudio_current_rating"] = await get_text_xpath("//div[div[text()='CODESTUDIO']]//h3")
             data["contestRankings"]["codestudio_max-rating"] = await page.evaluate(get_rating_snippet('CODESTUDIO'))
 
-            # 5. Heatmap
+            # Heatmap
             try:
                 data["heatmap"] = await page.eval_on_selector_all(
                     "svg.react-calendar-heatmap rect",
@@ -470,8 +414,7 @@ async def scrape_codolio(username: str):
                         return null;
                     }).filter(x => x !== null)"""
                 )
-            except:
-                data["heatmap"] = []
+            except: data["heatmap"] = []
 
             # 4. Detailed Contest History
             for platform_name, key in PLATFORMS:
@@ -500,7 +443,9 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "browser_ready": state.browser is not None}
+    # Don't check browser instance here to avoid race conditions or overhead.
+    # Just return healthy.
+    return {"status": "healthy"}
 
 @app.get("/codolio/{username}")
 async def get_profile(username: str):
@@ -515,16 +460,14 @@ async def post_profile(request: UsernameRequest):
 async def scrape_generic_profile(username: str, platform: str):
     if not state.browser: raise HTTPException(status_code=500, detail="Browser not initialized")
     url = f"https://codolio.com/profile/{username}/problemSolving/{platform}"
-    
     async with state.semaphore:
-        context = await state.browser.new_context(viewport={"width": 1280, "height": 720})
+        context = await state.browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await get_page(context)
-        
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            try: await page.wait_for_selector("text=Total Questions", timeout=15000)
+            try: await page.wait_for_selector("text=Total Questions", timeout=20000)
             except: pass 
-            await asyncio.sleep(1.5) 
+            await asyncio.sleep(2.0) 
 
             data = {"basicStats": {}, "problemsSolved": {}, "heatmap": []}
             async def get_text_xpath(xpath):
@@ -534,11 +477,9 @@ async def scrape_generic_profile(username: str, platform: str):
                 except: pass
                 return "0"
             
-            # Basic Stats
             data["basicStats"]["total_questions"] = await get_text_xpath("//div[div[contains(text(), 'Total Questions')]]/span[contains(@class, 'text-5xl')]")
             data["basicStats"]["total_active_days"] = await get_text_xpath("//div[div[contains(text(), 'Total Active Days')]]/span[contains(@class, 'text-5xl')]")
             
-            # Heatmap
             try:
                 data["heatmap"] = await page.eval_on_selector_all(
                     "svg.react-calendar-heatmap rect",
@@ -550,7 +491,6 @@ async def scrape_generic_profile(username: str, platform: str):
                 )
             except: data["heatmap"] = []
             
-            # Problems Solved
             data["problemsSolved"]["total_solved"] = await get_text_xpath("//div[contains(@class, 'absolute inset-0')]/span[contains(@class, 'text-2xl')]")
             for level in ["Easy", "Medium", "Hard"]:
                 data["problemsSolved"][level.lower()] = await get_text_xpath(f"//div[div[contains(text(), '{level}')]]/span")
@@ -563,19 +503,15 @@ async def scrape_generic_profile(username: str, platform: str):
         await context.close()
         return data
 
-# Endpoints
 @app.get("/tuf/{username}")
 async def get_tuf_profile(username: str):
     return {"success": True, "username": username, "data": await scrape_generic_profile(username.strip(), "tuf")}
-
 @app.get("/codestudio/{username}")
 async def get_codestudio_profile(username: str):
     return {"success": True, "username": username, "data": await scrape_generic_profile(username.strip(), "codestudio")}
-
 @app.get("/interviewbit/{username}")
 async def get_interviewbit_profile(username: str):
     return {"success": True, "username": username, "data": await scrape_generic_profile(username.strip(), "interviewbit")}
-
 @app.get("/geeksforgeeks/{username}")
 async def get_geeksforgeeks_profile(username: str):
     return {"success": True, "username": username, "data": await scrape_generic_profile(username.strip(), "geeksforgeeks")}
@@ -585,14 +521,14 @@ async def scrape_contest_platform(username: str, platform: str):
     url = f"https://codolio.com/profile/{username}/problemSolving/{platform}"
     
     async with state.semaphore:
-        context = await state.browser.new_context(viewport={"width": 1280, "height": 720})
+        context = await state.browser.new_context(viewport={"width": 1920, "height": 1080})
         page = await get_page(context)
         
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            try: await page.wait_for_selector("text=Total Questions", timeout=15000)
+            try: await page.wait_for_selector("text=Total Questions", timeout=20000)
             except: pass 
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(2.0)
 
             data = {"basicStats": {}, "problemsSolved": {}, "contestRankings": {}, "heatmap": []}
             async def get_text_xpath(xpath):
