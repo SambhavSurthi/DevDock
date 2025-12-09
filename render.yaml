@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: codolio-scraper
+    name: devdock
     env: docker
     plan: free
     branch: main
